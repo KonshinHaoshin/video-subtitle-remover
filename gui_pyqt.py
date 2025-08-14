@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-PyQt5 版 - 视频字幕去除器 GUI（延迟导入 torch，不卡主线程）
+PyQt5 版 - 视频字幕去除器 GUI（支持在预览中用鼠标框选字幕区域）
+- 在左侧预览上按下并拖拽，即可绘制矩形选择区域
+- 松开鼠标后会自动把所选矩形映射为原始分辨率下的 (x, y, w, h)，并回写到右侧滑块（可微调）
+- 多文件：若分辨率一致，则共用同一选择区域；否则仍按“全屏自动处理（None）”逻辑
 Author: You
 """
 
@@ -13,12 +16,12 @@ from threading import Thread
 from typing import List, Optional, Tuple
 import importlib
 
-from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QPoint, QRect
 from PyQt5.QtGui import QImage, QPixmap, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog,
     QHBoxLayout, QVBoxLayout, QGroupBox, QSlider, QProgressBar, QPlainTextEdit,
-    QFrame, QAction, QToolBar, QStyle, QSizePolicy, QMessageBox
+    QFrame, QAction, QToolBar, QStyle, QSizePolicy, QMessageBox, QRubberBand
 )
 
 # --- 复用你的项目结构（只导入轻量模块） ---
@@ -60,6 +63,44 @@ def letterbox(frame, target_w, target_h):
     return canvas
 
 
+class PreviewLabel(QLabel):
+    """带橡皮筋框选能力的预览控件，发出 label 坐标系的选区。"""
+    selectionFinished = pyqtSignal(int, int, int, int)  # x, y, w, h (label coords)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._rb = QRubberBand(QRubberBand.Rectangle, self)
+        self._origin = QPoint()
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._origin = event.pos()
+            self._dragging = True
+            self._rb.setGeometry(QRect(self._origin, QSize()))
+            self._rb.show()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            rect = QRect(self._origin, event.pos()).normalized()
+            # 限制在控件范围内
+            rect = rect.intersected(self.rect())
+            self._rb.setGeometry(rect)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            rect = QRect(self._origin, event.pos()).normalized()
+            rect = rect.intersected(self.rect())
+            self._rb.hide()
+            if rect.width() > 2 and rect.height() > 2:
+                self.selectionFinished.emit(rect.x(), rect.y(), rect.width(), rect.height())
+        super().mouseReleaseEvent(event)
+
+
 class SubtitleRemoverWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -91,7 +132,7 @@ class SubtitleRemoverWindow(QMainWindow):
         self.x_val = 0
         self.w_val = 0
 
-        # 预览尺寸
+        # 预览尺寸（用于 letterbox 计算）
         self.preview_w = 960
         self.preview_h = 540
 
@@ -142,11 +183,12 @@ class SubtitleRemoverWindow(QMainWindow):
         self.setCentralWidget(root)
 
         # 左侧：预览 + 时间轴
-        self.lbl_preview = QLabel()
+        self.lbl_preview = PreviewLabel()
         self.lbl_preview.setAlignment(Qt.AlignCenter)
         self.lbl_preview.setMinimumSize(self.preview_w, self.preview_h)
         self.lbl_preview.setFrameShape(QFrame.NoFrame)
         self.lbl_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl_preview.selectionFinished.connect(self._on_label_selection)
 
         self.slider_timeline = QSlider(Qt.Horizontal)
         self.slider_timeline.setEnabled(False)
@@ -159,7 +201,7 @@ class SubtitleRemoverWindow(QMainWindow):
         # 右侧：控制区
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setPlaceholderText("输出日志...")
+        self.txt_log.setPlaceholderText("输出日志...\n提示：在左侧预览中按下并拖拽鼠标即可框选字幕区域。")
 
         # 垂直（Y 起点 / 高度）
         grp_v = QGroupBox("Vertical")
@@ -244,6 +286,7 @@ class SubtitleRemoverWindow(QMainWindow):
         self.log("Open Video/Image Success:")
         for p in self.video_paths:
             self.log(f"  - {p}")
+        self.log("在预览中按下并拖拽鼠标即可框选字幕区域；右侧滑块可微调。")
 
         # 打开第一项获取属性
         if self.cap:
@@ -293,10 +336,19 @@ class SubtitleRemoverWindow(QMainWindow):
         x = int(self.frame_w * x_p)
         w = int(self.frame_w * w_p)
 
+        self._apply_area_to_sliders(x, y, w, h)
+
+    def _apply_area_to_sliders(self, x: int, y: int, w: int, h: int):
+        # 统一设置（含范围），避免信号相互触发抖动
         self.slider_y.blockSignals(True)
         self.slider_h.blockSignals(True)
         self.slider_x.blockSignals(True)
         self.slider_w.blockSignals(True)
+
+        y = max(0, min(y, self.frame_h))
+        x = max(0, min(x, self.frame_w))
+        h = max(0, min(h, self.frame_h - y))
+        w = max(0, min(w, self.frame_w - x))
 
         self.slider_y.setRange(0, self.frame_h if self.frame_h else 0)
         self.slider_y.setValue(y)
@@ -316,7 +368,7 @@ class SubtitleRemoverWindow(QMainWindow):
         self.slider_w.blockSignals(False)
 
     def _update_preview(self, frame):
-        # 根据滑块画矩形
+        # 使用当前滑块值绘制矩形
         y = self.slider_y.value()
         h = self.slider_h.value()
         x = self.slider_x.value()
@@ -328,7 +380,8 @@ class SubtitleRemoverWindow(QMainWindow):
         w = max(0, min(w, self.frame_w - x))
 
         draw = frame.copy()
-        cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 255, 0), 3)
+        if w > 0 and h > 0:
+            cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 255, 0), 3)
 
         boxed = letterbox(draw, self.preview_w, self.preview_h)
         pix = bgr_to_qpixmap(boxed, (self.lbl_preview.width(), self.lbl_preview.height()))
@@ -385,6 +438,82 @@ class SubtitleRemoverWindow(QMainWindow):
         ok, frame = self.cap.read()
         if ok:
             self._update_preview(frame)
+
+    # ---- 预览框选 -> 映射到原始分辨率并写回滑块 ----
+    def _on_label_selection(self, lx: int, ly: int, lw: int, lh: int):
+        if self.frame_w <= 0 or self.frame_h <= 0:
+            return
+        mapped = self._label_rect_to_original_rect(lx, ly, lw, lh)
+        if mapped is None:
+            return
+        x, y, w, h = mapped
+        self._apply_area_to_sliders(x, y, w, h)
+        self._preview_current()
+
+    def _label_rect_to_original_rect(self, lx: int, ly: int, lw: int, lh: int) -> Optional[Tuple[int, int, int, int]]:
+        """
+        把 label 坐标系中的矩形映射回“原始帧分辨率”的 (x,y,w,h)。
+        步骤：label -> （缩放后）boxed -> （去除 letterbox 边）原始坐标。
+        """
+        Lw, Lh = float(self.lbl_preview.width()), float(self.lbl_preview.height())
+        preW, preH = float(self.preview_w), float(self.preview_h)
+        if Lw <= 0 or Lh <= 0:
+            return None
+
+        # 第二次缩放（boxed -> label）
+        scale2 = min(Lw / preW, Lh / preH)
+        dispW = preW * scale2
+        dispH = preH * scale2
+        offX = (Lw - dispW) / 2.0
+        offY = (Lh - dispH) / 2.0
+
+        # label -> boxed 坐标
+        bx1 = (lx - offX) / scale2
+        by1 = (ly - offY) / scale2
+        bx2 = (lx + lw - offX) / scale2
+        by2 = (ly + lh - offY) / scale2
+
+        # 限制在 boxed 区域
+        bx1 = max(0.0, min(preW, bx1))
+        by1 = max(0.0, min(preH, by1))
+        bx2 = max(0.0, min(preW, bx2))
+        by2 = max(0.0, min(preH, by2))
+        if bx2 <= bx1 or by2 <= by1:
+            return None
+
+        # 第一次 letterbox（frame -> boxed）
+        fw, fh = float(self.frame_w), float(self.frame_h)
+        scale = min(preW / fw, preH / fh)
+        imgW = fw * scale
+        imgH = fh * scale
+        left = (preW - imgW) / 2.0
+        top = (preH - imgH) / 2.0
+
+        # 约束到真实图像区域（去掉上下黑边/左右黑边）
+        bx1 = max(left, min(left + imgW, bx1))
+        bx2 = max(left, min(left + imgW, bx2))
+        by1 = max(top,  min(top + imgH, by1))
+        by2 = max(top,  min(top + imgH, by2))
+        if bx2 <= bx1 or by2 <= by1:
+            return None
+
+        # boxed -> 原始像素
+        ox1 = int(round((bx1 - left) / scale))
+        oy1 = int(round((by1 - top) / scale))
+        ox2 = int(round((bx2 - left) / scale))
+        oy2 = int(round((by2 - top) / scale))
+
+        # clamp
+        ox1 = max(0, min(int(fw), ox1))
+        oy1 = max(0, min(int(fh), oy1))
+        ox2 = max(0, min(int(fw), ox2))
+        oy2 = max(0, min(int(fh), oy2))
+
+        x = min(ox1, ox2)
+        y = min(oy1, oy2)
+        w = max(1, abs(ox2 - ox1))
+        h = max(1, abs(oy2 - oy1))
+        return x, y, w, h
 
     # ---- 运行处理（延迟导入 torch） ----
     def on_run(self):

@@ -1,5 +1,9 @@
 # 对UI进行优化的video-subtitle-remover
 使用pyqt重新做了一个交互性更强的ui
+用户可以直接在界面上框选即可
+![img_1.png](img_1.png)
+![img_2.png](img_2.png)
+![img.png](img.png)
 
 # 以下是源仓库的README
 
