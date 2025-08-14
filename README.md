@@ -1,3 +1,8 @@
+# 对UI进行优化的video-subtitle-remover
+使用pyqt重新做了一个交互性更强的ui
+
+# 以下是源仓库的README
+
 简体中文 | [English](README_en.md)
 
 ## 项目简介
